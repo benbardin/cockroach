@@ -289,6 +289,9 @@ const (
 	// processing.
 	MVCCIndexBackfiller
 
+	// IncrementalBackupSubdir enables backing up new incremental backups to a
+	// dedicated subdirectory, to make it easier to apply a different ttl.
+	IncrementalBackupSubdir
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -459,6 +462,10 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     MVCCIndexBackfiller,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 68},
+	},
+	{
+		Key:     IncrementalBackupSubdir,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 0},
 	},
 	// *************************************************
 	// Step (2): Add new versions here.
