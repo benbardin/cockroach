@@ -31,7 +31,7 @@ import (
 	"github.com/kr/pretty"
 )
 
-type sstSinkConf struct {
+type fileSSTSinkConf struct {
 	progCh   chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
 	enc      *roachpb.FileEncryptionOptions
 	id       base.SQLInstanceID
@@ -40,9 +40,10 @@ type sstSinkConf struct {
 
 type fileSSTSink struct {
 	dest cloud.ExternalStorage
-	conf sstSinkConf
+	conf fileSSTSinkConf
 
 	queue []exportedSpan
+
 	// queueCap is the maximum byte size that the queue can grow to.
 	queueCap int64
 	// queueSize is the current byte size of the queue.
@@ -74,7 +75,10 @@ type fileSSTSink struct {
 }
 
 func makeFileSSTSink(
-	ctx context.Context, conf sstSinkConf, dest cloud.ExternalStorage, backupMem *mon.BoundAccount,
+	ctx context.Context,
+	conf fileSSTSinkConf,
+	dest cloud.ExternalStorage,
+	backupMem *mon.BoundAccount,
 ) (*fileSSTSink, error) {
 	s := &fileSSTSink{conf: conf, dest: dest}
 	s.memAcc.ba = backupMem
@@ -87,14 +91,25 @@ func makeFileSSTSink(
 	maxSize := smallFileBuffer.Get(s.conf.settings)
 	for {
 		if s.queueCap >= maxSize {
+			if _, err := pretty.Println("##### Did it: %v, %v", s.queueCap, maxSize); err != nil {
+				return nil, err
+			}
 			break
 		}
 
 		if incrementSize > maxSize-s.queueCap {
+			if _, err := pretty.Println("##### Inc: %v, %v, %v", incrementSize, maxSize, s.queueCap); err != nil {
+				return nil, err
+			}
 			incrementSize = maxSize - s.queueCap
 		}
 
 		if err := s.memAcc.ba.Grow(ctx, incrementSize); err != nil {
+			if s.queueCap == 0 {
+				if _, err := pretty.Println("##### Err: %v", err); err != nil {
+					return nil, err
+				}
+			}
 			log.Infof(ctx, "failed to grow file queue by %d bytes, running backup with queue size %d bytes: %+v", incrementSize, s.queueCap, err)
 			break
 		}

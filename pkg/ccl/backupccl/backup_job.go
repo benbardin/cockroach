@@ -121,6 +121,7 @@ func clusterNodeCount(gw gossip.OptionalGossip) (int, error) {
 func backup(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
+	mem *mon.BoundAccount,
 	defaultURI string,
 	urisByLocalityKV map[string]string,
 	db *kv.DB,
@@ -210,6 +211,18 @@ func backup(
 		}
 	}
 
+	sinkConf := cabinetSSTSinkConf{
+		id:       execCtx.ExecCfg().NodeID.SQLInstanceID(),
+		enc:      encryption,
+		settings: &settings.SV,
+	}
+
+	cabinetSink, err := makeCabinetSSTSink(ctx, sinkConf, defaultStore, mem)
+	if err != nil {
+		return roachpb.RowCount{}, err
+	}
+	defer cabinetSink.Close()
+
 	progCh := make(chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
 	checkpointLoop := func(ctx context.Context) error {
 		// When a processor is done exporting a span, it will send a progress update
@@ -225,8 +238,17 @@ func backup(
 				backupManifest.RevisionStartTime = progDetails.RevStartTime
 			}
 			for _, file := range progDetails.Files {
+				// TODO(benbardin): Stop writing these once Restore no longer needs them.
 				backupManifest.Files = append(backupManifest.Files, file)
+
 				backupManifest.EntryCounts.Add(file.EntryCounts)
+				cabinetID, err := cabinetSink.push(file)
+				if err != nil {
+					return err
+				}
+				if cabinetID != nil {
+					backupManifest.CabinetIDs = append(backupManifest.CabinetIDs, *cabinetID)
+				}
 				numBackedUpFiles++
 			}
 
@@ -550,6 +572,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		res, err = backup(
 			ctx,
 			p,
+			&mem,
 			details.URI,
 			details.URIsByLocalityKV,
 			p.ExecCfg().DB,
