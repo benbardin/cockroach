@@ -295,6 +295,8 @@ export const Tracez = () => {
       snapshot_id: id,
     });
     getTracingSnapshot(req).then(req => {
+      console.log("### getTracingSnapshot")
+      console.log(req)
       setSnapshot({
         id: req.snapshot.snapshot_id,
         captured_at: req.snapshot.captured_at,
@@ -346,6 +348,7 @@ export const Tracez = () => {
             snapshot_id: snapshot.id,
           }),
         ).then(resp => {
+          console.log(resp)
           setCurrentTrace(resp);
           setShowTrace(true);
         });

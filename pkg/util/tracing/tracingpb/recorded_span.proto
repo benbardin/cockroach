@@ -103,6 +103,12 @@ message RecordedSpan {
   // DeprecatedInternalStructured only stores the Payloads.
   repeated StructuredRecord structured_records = 14 [(gogoproto.nullable) = false];
 
+  // A mechanism for defining a tag hierarchy that is strictly additive for
+  // backwards compatibility.
+  map<string, string> nested_tag_to_parent = 18 [(gogoproto.customname) = "NestedTagToParent"];
+
+  // Next ID: 19
+
   reserved 5,10,11;
 }
 

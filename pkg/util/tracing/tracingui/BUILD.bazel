@@ -8,5 +8,6 @@ go_library(
     deps = [
         "//pkg/util/tracing",
         "//pkg/util/tracing/tracingpb",
+        "@com_github_kr_pretty//:pretty",
     ],
 )

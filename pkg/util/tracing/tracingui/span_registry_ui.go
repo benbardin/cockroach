@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/kr/pretty"
 )
 
 // This file has helpers for the RPCs done by the #/debug/tracez page, which
@@ -31,6 +32,8 @@ func ProcessSnapshot(
 	registry.VisitSpans(func(sp tracing.RegistrySpan) {
 		currentSpans[sp.SpanID()] = sp.RecordingType()
 	})
+	_, _ = pretty.Println("-----")
+	_, _ = pretty.Println(snapshot.Traces)
 
 	// Flatten the recordings.
 	spans := make([]tracingpb.RecordedSpan, 0, len(snapshot.Traces)*3)
@@ -141,6 +144,7 @@ type ProcessedTag struct {
 	// copiedFromChild is set if this tag did not originate on the owner span, but
 	// instead was propagated upwards from a child span.
 	CopiedFromChild bool
+	Children        []ProcessedTag
 }
 
 // propagateTagUpwards copies tag from sp to all of sp's ancestors.
@@ -182,16 +186,31 @@ func processSpan(s tracingpb.RecordedSpan, snap tracing.SpansSnapshot) processed
 		GoroutineID:  s.GoroutineID,
 	}
 
-	// Sort the tags.
-	tagKeys := make([]string, 0, len(s.Tags))
-	for k := range s.Tags {
-		tagKeys = append(tagKeys, k)
+	parentTagToChildren := make(map[string][]string)
+	for childKey, parentKey := range s.NestedTagToParent {
+		if parentTagToChildren[parentKey] == nil {
+			parentTagToChildren[parentKey] = make([]string, 0)
+		}
+		parentTagToChildren[parentKey] = append(parentTagToChildren[parentKey], childKey)
 	}
-	sort.Strings(tagKeys)
+
+	// Sort the tags.
+	rootTagKeys := make([]string, 0, len(s.Tags)-len(s.NestedTagToParent))
+	for k := range s.Tags {
+		if _, ok := s.NestedTagToParent[k]; ok {
+			continue
+		}
+		rootTagKeys = append(rootTagKeys, k)
+	}
+	sort.Strings(rootTagKeys)
+
+	for _, childTags := range parentTagToChildren {
+		sort.Strings(childTags)
+	}
 
 	p.Tags = make([]ProcessedTag, len(s.Tags))
-	for i, k := range tagKeys {
-		p.Tags[i] = processTag(k, s.Tags[k], snap)
+	for i, k := range rootTagKeys {
+		p.Tags[i] = processTag(k, s.Tags, parentTagToChildren, snap)
 	}
 	return p
 }
@@ -199,7 +218,13 @@ func processSpan(s tracingpb.RecordedSpan, snap tracing.SpansSnapshot) processed
 // processTag massages span tags for presentation in the UI. It marks some tags
 // as hidden, it marks some tags to be inherited by child spans, and it expands
 // lock contention tags with information about the lock holder txn.
-func processTag(k, v string, snap tracing.SpansSnapshot) ProcessedTag {
+func processTag(
+	k string,
+	tags map[string]string,
+	parentTagToChildren map[string][]string,
+	snap tracing.SpansSnapshot,
+) ProcessedTag {
+	v := tags[k]
 	p := ProcessedTag{
 		Key: k,
 		Val: v,
@@ -227,6 +252,17 @@ func processTag(k, v string, snap tracing.SpansSnapshot) ProcessedTag {
 	case "statement":
 		p.Inherit = true
 		p.PropagateUp = true
+	}
+
+	if childTagKeys, ok := parentTagToChildren[k]; ok {
+		p.Children = make([]ProcessedTag, 0, len(childTagKeys))
+		for _, childTagKey := range childTagKeys {
+			p.Children = append(p.Children, processTag(
+				childTagKey,
+				tags,
+				parentTagToChildren,
+				snap))
+		}
 	}
 
 	return p

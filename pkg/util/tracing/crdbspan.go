@@ -746,6 +746,14 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		rs.Tags[k] = v
 	}
 
+	addNestedTag := func(childKey, childValue, parentKey string) {
+		addTag(childKey, childValue)
+		if rs.NestedTagToParent == nil {
+			rs.NestedTagToParent = make(map[string]string)
+		}
+		rs.NestedTagToParent[childKey] = parentKey
+	}
+
 	// If the span is not verbose, optimize by avoiding the tags.
 	// This span is likely only used to carry payloads around.
 	//
@@ -788,7 +796,7 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 			switch v := kv.Value.(type) {
 			case LazyTag:
 				for _, tag := range v.Render() {
-					addTag(string(tag.Key), tag.Value.Emit())
+					addNestedTag(string(tag.Key), tag.Value.Emit(), kv.Key)
 				}
 			case fmt.Stringer:
 				addTag(kv.Key, v.String())

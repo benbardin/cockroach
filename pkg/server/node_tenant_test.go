@@ -108,6 +108,7 @@ func TestRedactRecordingForTenant(t *testing.T) {
 			GoroutineID       uint64
 			Finished          bool
 			StructuredRecords []tracingpb.StructuredRecord
+			NestedTagToParent map[string]string
 		}
 		_ = (*calcifiedRecordedSpan)((*tracingpb.RecordedSpan)(nil))
 	})
