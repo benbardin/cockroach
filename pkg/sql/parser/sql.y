@@ -1069,6 +1069,7 @@ func (u *sqlSymUnion) routineBody() *tree.RoutineBody {
 %type <tree.Statement> create_index_stmt
 %type <tree.Statement> create_role_stmt
 %type <tree.Statement> create_schedule_for_backup_stmt
+%type <tree.Statement> alter_backup_schedule
 %type <tree.Statement> create_schema_stmt
 %type <tree.Statement> create_table_stmt
 %type <tree.Statement> create_table_as_stmt
@@ -1233,6 +1234,8 @@ func (u *sqlSymUnion) routineBody() *tree.RoutineBody {
 
 %type <tree.AlterChangefeedCmd> alter_changefeed_cmd
 %type <tree.AlterChangefeedCmds> alter_changefeed_cmds
+%type <tree.AlterScheduleForBackupCmd> alter_backup_schedule_cmd
+%type <tree.AlterScheduleForBackupCmds> alter_backup_schedule_cmds
 
 %type <tree.BackupKMS> backup_kms
 %type <tree.AlterBackupCmd> alter_backup_cmd
@@ -1664,6 +1667,7 @@ alter_ddl_stmt:
 | alter_default_privileges_stmt // EXTEND WITH HELP: ALTER DEFAULT PRIVILEGES
 | alter_changefeed_stmt         // EXTEND WITH HELP: ALTER CHANGEFEED
 | alter_backup_stmt             // EXTEND WITH HELP: ALTER BACKUP
+| alter_backup_schedule  // EXTEND WITH HELP: ALTER SCHEDULE
 
 // %Help: ALTER TABLE - change the definition of a table
 // %Category: DDL
@@ -3064,6 +3068,61 @@ create_schedule_for_backup_stmt:
       }
   }
  | CREATE SCHEDULE error  // SHOW HELP: CREATE SCHEDULE FOR BACKUP
+
+
+// %Help: ALTER SCHEDULE <:id> FOR BACKUP - backup data periodically
+// %Category: CCL
+// %Text:
+alter_backup_schedule:
+  ALTER BACKUP SCHEDULE iconst64 SET alter_backup_schedule_cmds
+  {
+    $$.val = &tree.AlterScheduledBackup{
+
+    }
+  }
+  | ALTER SCHEDULE error  // SHOW HELP: ALTER SCHEDULE FOR BACKUP
+
+alter_backup_schedule_cmds:
+  alter_backup_schedule_cmd
+  {
+    $$.val = tree.AlterChangefeedCmds{$1.alterChangefeedCmd()}
+  }
+| alter_backup_schedule_cmds alter_backup_schedule_cmd
+  {
+    $$.val = append($1.alterChangefeedCmds(), $2.alterChangefeedCmd())
+  }
+
+alter_backup_schedule_cmd:
+	POLYGON targets
+	{
+
+	}
+| INTO string_or_placeholder_opt_list
+  {
+
+  }
+| OPTIONS backup_options_list
+  {
+
+  }
+| cron_expr
+  {
+
+  }
+| FULL BACKUP ALWAYS
+  {
+
+  }
+| FULL BACKUP sconst_or_placeholder
+  {
+
+  }
+| SCHEDULE OPTIONS kv_option_list
+  {
+
+  }
+
+
 
 // sconst_or_placeholder matches a simple string, or a placeholder.
 sconst_or_placeholder:
