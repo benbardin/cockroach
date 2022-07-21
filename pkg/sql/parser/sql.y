@@ -872,7 +872,7 @@ func (u *sqlSymUnion) routineBody() *tree.RoutineBody {
 
 %token <str> KEY KEYS KMS KV
 
-%token <str> LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
+%token <str> LABEL LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEAKPROOF LEFT LESS LEVEL LIKE LIMIT
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
 %token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGIN LOOKUP LOW LSHIFT
@@ -3070,11 +3070,11 @@ create_schedule_for_backup_stmt:
  | CREATE SCHEDULE error  // SHOW HELP: CREATE SCHEDULE FOR BACKUP
 
 
-// %Help: ALTER SCHEDULE <:id> FOR BACKUP - backup data periodically
+// %Help: ALTER BACKUP SCHEDULE <id> - backup data periodically
 // %Category: CCL
 // %Text:
 alter_backup_schedule:
-  ALTER BACKUP SCHEDULE iconst64 SET alter_backup_schedule_cmds
+  ALTER BACKUP SCHEDULE iconst64 alter_backup_schedule_cmds
   {
     $$.val = &tree.AlterScheduledBackup{
 
@@ -3082,44 +3082,54 @@ alter_backup_schedule:
   }
   | ALTER SCHEDULE error  // SHOW HELP: ALTER SCHEDULE FOR BACKUP
 
+
 alter_backup_schedule_cmds:
   alter_backup_schedule_cmd
   {
-    $$.val = tree.AlterChangefeedCmds{$1.alterChangefeedCmd()}
+    $$.val = tree.AlterBackupScheduleCmds{$1.alterBackupScheduleCmd()}
   }
-| alter_backup_schedule_cmds alter_backup_schedule_cmd
+| alter_backup_schedule_cmds ',' alter_backup_schedule_cmd
   {
-    $$.val = append($1.alterChangefeedCmds(), $2.alterChangefeedCmd())
+    $$.val = append($1.AlterBackupScheduleCmds(), $3.alterBackupScheduleCmd())
   }
+
 
 alter_backup_schedule_cmd:
-	POLYGON targets
+  SET LABEL string_or_placeholder
 	{
-
+		$$.val = $3.expr()
 	}
-| INTO string_or_placeholder_opt_list
+|	SET INTO string_or_placeholder_opt_list
   {
-
+		$$.val = $3.stringOrPlaceholderOptList()
   }
-| OPTIONS backup_options_list
+| SET WITH backup_options
+	{
+		$$.val = $3.backupOptions()
+	}
+| UNSET WITH backup_options
+	{
+		$$.val = $3.backupOptions()
+	}
+| SET cron_expr
   {
-
+		$$.val = $2.expr()
   }
-| cron_expr
+| SET FULL BACKUP ALWAYS
   {
-
+		$$.val = &tree.FullBackupClause{AlwaysFull: true}
   }
-| FULL BACKUP ALWAYS
+| SET FULL BACKUP sconst_or_placeholder
   {
-
+		$$.val = &tree.FullBackupClause{Recurrence: $4.expr()}
   }
-| FULL BACKUP sconst_or_placeholder
+| SET SCHEDULE OPTION kv_option
   {
-
+		$$.val = $4.kvOption()
   }
-| SCHEDULE OPTIONS kv_option_list
+| UNSET SCHEDULE OPTION kv_option
   {
-
+		$$.val = $4.kvOption()
   }
 
 
@@ -14601,6 +14611,7 @@ unreserved_keyword:
 | KEYS
 | KMS
 | KV
+| LABEL
 | LANGUAGE
 | LAST
 | LATEST
