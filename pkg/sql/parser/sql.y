@@ -569,6 +569,12 @@ func (u *sqlSymUnion) alterBackupCmd() tree.AlterBackupCmd {
 func (u *sqlSymUnion) alterBackupCmds() tree.AlterBackupCmds {
     return u.val.(tree.AlterBackupCmds)
 }
+func (u *sqlSymUnion) alterBackupScheduleCmd() tree.AlterBackupScheduleCmd {
+    return u.val.(tree.AlterBackupScheduleCmd)
+}
+func (u *sqlSymUnion) alterBackupScheduleCmds() tree.AlterBackupScheduleCmds {
+    return u.val.(tree.AlterBackupScheduleCmds)
+}
 func (u *sqlSymUnion) alterTableCmd() tree.AlterTableCmd {
     return u.val.(tree.AlterTableCmd)
 }
@@ -1208,7 +1214,7 @@ func (u *sqlSymUnion) routineBody() *tree.RoutineBody {
 %type <[]string> opt_incremental
 %type <tree.KVOption> kv_option
 %type <[]tree.KVOption> kv_option_list opt_with_options var_set_list opt_with_schedule_options
-%type <*tree.BackupOptions> opt_with_backup_options backup_options backup_options_list
+%type <*tree.BackupOptions> opt_with_backup_options backup_options backup_options_list backup_options_keys
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
 %type <tree.ShowBackupDetails> show_backup_details
 %type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list
@@ -1234,8 +1240,8 @@ func (u *sqlSymUnion) routineBody() *tree.RoutineBody {
 
 %type <tree.AlterChangefeedCmd> alter_changefeed_cmd
 %type <tree.AlterChangefeedCmds> alter_changefeed_cmds
-%type <tree.AlterScheduleForBackupCmd> alter_backup_schedule_cmd
-%type <tree.AlterScheduleForBackupCmds> alter_backup_schedule_cmds
+%type <tree.AlterBackupScheduleCmd> alter_backup_schedule_cmd
+%type <tree.AlterBackupScheduleCmds> alter_backup_schedule_cmds
 
 %type <tree.BackupKMS> backup_kms
 %type <tree.AlterBackupCmd> alter_backup_cmd
@@ -2956,6 +2962,7 @@ backup_options_list:
   }
 
 // List of valid backup options.
+// Keep in sync with backup_options_keys below.
 backup_options:
   ENCRYPTION_PASSPHRASE '=' string_or_placeholder
   {
@@ -2977,6 +2984,29 @@ backup_options:
   {
   $$.val = &tree.BackupOptions{IncrementalStorage: $3.stringOrPlaceholderOptList()}
   }
+
+// Used for UNSET. Keep in sync with backup_options above.
+backup_options_keys:
+	ENCRYPTION_PASSPHRASE
+	{
+		$$.val = &tree.BackupOptions{EncryptionPassphrase: tree.Expr(nil)}
+	}
+| REVISION_HISTORY
+	{
+		$$.val = &tree.BackupOptions{CaptureRevisionHistory: false}
+	}
+| DETACHED
+	{
+		$$.val = &tree.BackupOptions{Detached: false}
+	}
+| KMS
+	{
+		$$.val = &tree.BackupOptions{EncryptionKMSURI: nil}
+	}
+| INCREMENTAL_LOCATION
+	{
+		$$.val = &tree.BackupOptions{IncrementalStorage: nil}
+	}
 
 
 // %Help: CREATE SCHEDULE FOR BACKUP - backup data periodically
@@ -3076,8 +3106,9 @@ create_schedule_for_backup_stmt:
 alter_backup_schedule:
   ALTER BACKUP SCHEDULE iconst64 alter_backup_schedule_cmds
   {
-    $$.val = &tree.AlterScheduledBackup{
-
+    $$.val = &tree.AlterBackupSchedule{
+			ScheduleID: $4.int64(),
+			Cmds:       $5.alterBackupScheduleCmds(),
     }
   }
   | ALTER SCHEDULE error  // SHOW HELP: ALTER SCHEDULE FOR BACKUP
@@ -3090,46 +3121,64 @@ alter_backup_schedule_cmds:
   }
 | alter_backup_schedule_cmds ',' alter_backup_schedule_cmd
   {
-    $$.val = append($1.AlterBackupScheduleCmds(), $3.alterBackupScheduleCmd())
+    $$.val = append($1.alterBackupScheduleCmds(), $3.alterBackupScheduleCmd())
   }
 
 
 alter_backup_schedule_cmd:
   SET LABEL string_or_placeholder
 	{
-		$$.val = $3.expr()
+		$$.val = &tree.AlterBackupScheduleSetLabel{
+		  Label: $3.expr(),
+		}
 	}
 |	SET INTO string_or_placeholder_opt_list
   {
-		$$.val = $3.stringOrPlaceholderOptList()
+		$$.val = &tree.AlterBackupScheduleSetInto{
+		  Into: $3.stringOrPlaceholderOptList(),
+		}
   }
 | SET WITH backup_options
 	{
-		$$.val = $3.backupOptions()
+		$$.val = &tree.AlterBackupScheduleSetWith{
+		  With: $3.backupOptions(),
+		}
 	}
-| UNSET WITH backup_options
+| UNSET WITH backup_options_keys
 	{
-		$$.val = $3.backupOptions()
+		$$.val = &tree.AlterBackupScheduleUnsetWith{
+			With: $3.backupOptions(),
+		}
 	}
 | SET cron_expr
   {
-		$$.val = $2.expr()
+		$$.val = &tree.AlterBackupScheduleSetRecurring{
+		  Recurrence: $2.expr(),
+		}
   }
 | SET FULL BACKUP ALWAYS
   {
-		$$.val = &tree.FullBackupClause{AlwaysFull: true}
+		$$.val = &tree.AlterBackupScheduleSetFullBackup{
+		  FullBackup: tree.FullBackupClause{AlwaysFull: true},
+		}
   }
 | SET FULL BACKUP sconst_or_placeholder
   {
-		$$.val = &tree.FullBackupClause{Recurrence: $4.expr()}
+    $$.val = &tree.AlterBackupScheduleSetFullBackup{
+		  FullBackup: tree.FullBackupClause{Recurrence: $4.expr()},
+		}
   }
 | SET SCHEDULE OPTION kv_option
   {
-		$$.val = $4.kvOption()
+		$$.val = &tree.AlterBackupScheduleSetScheduleOption{
+		  Option:  $4.kvOption(),
+		}
   }
-| UNSET SCHEDULE OPTION kv_option
+| UNSET SCHEDULE OPTION name
   {
-		$$.val = $4.kvOption()
+    $$.val = &tree.AlterBackupScheduleUnsetScheduleOption{
+		  Key: tree.Name($4),
+		}
   }
 
 
