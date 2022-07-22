@@ -11,12 +11,15 @@ package backupccl
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
@@ -24,6 +27,79 @@ import (
 )
 
 const alterBackupScheduleOp = "ALTER BACKUP SCHEDULE"
+
+func singleInitializedField(obj interface{}) (string, error) {
+	names := make([]string, 0)
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Struct {
+		// Programming defensively because reflection.
+		// This shouldn't happen; its presence indicates developer error.
+		return "", errors.Newf("Expected struct, got %s", objValue.Kind())
+	}
+	for i := 0; i < objValue.NumField(); i++ {
+		field := objValue.Field(i)
+		if field.IsZero() {
+			continue
+		}
+		names = append(names, objValue.Type().Field(i).Name)
+	}
+	if len(names) != 1 {
+		// Programming defensively because reflection.
+		// This shouldn't happen; its presence indicates developer error.
+		return "", errors.Newf("Expected 1 backup option, got %d: %s", len(names), names)
+	}
+	return names[0], nil
+}
+
+func validateAlterSchedule(alterSchedule *tree.AlterBackupSchedule) error {
+	if alterSchedule.ScheduleID == 0 {
+		return errors.Newf("Schedule ID expected, none found")
+	}
+	if len(alterSchedule.Cmds) == 0 {
+		return errors.Newf("Found no attributes to alter")
+	}
+	cmdTypeHistogram := make(map[string]int)
+
+	observe := func(tokens ...string) {
+		key := strings.Join(tokens, ":")
+		if _, ok := cmdTypeHistogram[key]; !ok {
+			cmdTypeHistogram[key] = 0
+		}
+		cmdTypeHistogram[key] += 1
+	}
+
+	for _, cmd := range alterSchedule.Cmds {
+		cmdType := reflect.ValueOf(cmd).Type().String()
+		switch typedCmd := cmd.(type) {
+		case *tree.AlterBackupScheduleSetWith:
+			fieldName, err := singleInitializedField(*typedCmd.With)
+			if err != nil {
+				return err
+			}
+			observe(cmdType, fieldName)
+		case *tree.AlterBackupScheduleUnsetWith:
+			fieldName, err := singleInitializedField(*typedCmd.With)
+			if err != nil {
+				return err
+			}
+			observe(cmdType, fieldName)
+		case *tree.AlterBackupScheduleSetScheduleOption:
+			observe(cmdType, string(typedCmd.Option.Key))
+		case *tree.AlterBackupScheduleUnsetScheduleOption:
+			observe(cmdType, string(typedCmd.Key))
+		default:
+			observe(cmdType)
+		}
+	}
+
+	for key := range cmdTypeHistogram {
+		val := cmdTypeHistogram[key]
+		if val > 1 {
+			return errors.Newf("Observed %d instances of %s, expected at most one.", val, key)
+		}
+	}
+	return nil
+}
 
 // doAlterBackupSchedule creates requested schedule (or schedules).
 // It is a plan hook implementation responsible for the creating of scheduled backup.
@@ -35,6 +111,10 @@ func doAlterBackupSchedules(
 ) error {
 	if err := p.RequireAdminRole(ctx, alterBackupScheduleOp); err != nil {
 		return err
+	}
+
+	if err := validateAlterSchedule(alterSchedule); err != nil {
+		return errors.Wrapf(err, "Invalid ALTER BACKUP command")
 	}
 
 	scheduleID := alterSchedule.ScheduleID
@@ -52,25 +132,65 @@ func doAlterBackupSchedules(
 	if err := pbtypes.UnmarshalAny(schedule.ExecutionArgs().Args, args); err != nil {
 		return errors.Wrap(err, "un-marshaling args")
 	}
+	node, err := parser.ParseOne(args.BackupStatement)
+	if err != nil {
+		return err
+	}
+	backupStmt, ok := node.AST.(*tree.Backup)
+	if !ok {
+		return errors.Newf("unexpected node type %T", node)
+	}
 
 	var dependentSchedule *jobs.ScheduledJob
 	dependentArgs := &backuppb.ScheduledBackupExecutionArgs{}
+	var dependentBackupStmt *tree.Backup
 	if args.DependentScheduleID != 0 {
 		dependentSchedule, err = jobs.LoadScheduledJob(ctx, env, args.DependentScheduleID, execCfg.InternalExecutor, p.Txn())
 		if err != nil {
 			return err
 		}
-		if err := pbtypes.UnmarshalAny(dependentSchedule.ExecutionArgs().Args, args); err != nil {
+		if err := pbtypes.UnmarshalAny(dependentSchedule.ExecutionArgs().Args, dependentArgs); err != nil {
 			return errors.Wrap(err, "un-marshaling args")
+		}
+		node, err := parser.ParseOne(dependentArgs.BackupStatement)
+		if err != nil {
+			return err
+		}
+		dependentBackupStmt, ok = node.AST.(*tree.Backup)
+		if !ok {
+			return errors.Newf("unexpected node type %T", node)
 		}
 	}
 
-	fmt.Println("-----------------------")
-	_, _ = pretty.Println(schedule)
-	_, _ = pretty.Println(args)
-	_, _ = pretty.Println(dependentSchedule)
-	_, _ = pretty.Println(dependentArgs)
+	var fullJob, incJob *jobs.ScheduledJob
+	var fullArgs, incArgs *backuppb.ScheduledBackupExecutionArgs
+	var fullStmt, incStmt *tree.Backup
+	if args.BackupType == backuppb.ScheduledBackupExecutionArgs_FULL {
+		fullJob, fullArgs, fullStmt = schedule, args, backupStmt
+		incJob, incArgs, incStmt = dependentSchedule, dependentArgs, dependentBackupStmt
+	} else {
+		fullJob, fullArgs, fullStmt = dependentSchedule, dependentArgs, dependentBackupStmt
+		incJob, incArgs, incStmt = schedule, args, backupStmt
+	}
+
 	fmt.Println("^^^^^^^^^^^^^^^^^^^^^^^")
+	_, _ = pretty.Println(fullJob)
+	_, _ = pretty.Println(fullArgs)
+	_, _ = pretty.Println(fullStmt)
+	fmt.Println("-----------------------")
+	_, _ = pretty.Println(incJob)
+	_, _ = pretty.Println(incArgs)
+	_, _ = pretty.Println(incStmt)
+	fmt.Println("$$$$$$$$$$$$$$$$$$$$$$$")
+
+	// [DONE] Validate: No duplicate command-types
+	// Is new schedule incremental?
+	// - Yes: If old schedule is full, add incremental
+	// - No:  If old schedule is inc, delete incremental.
+	// Make changes
+	// Verify backup
+	// save + return
+
 	return nil
 	/*
 		// Prepare backup statement (full).
