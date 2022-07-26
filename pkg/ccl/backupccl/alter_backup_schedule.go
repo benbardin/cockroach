@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -101,6 +102,30 @@ func validateAlterSchedule(alterSchedule *tree.AlterBackupSchedule) error {
 	return nil
 }
 
+func findFullBackupClause(alterSchedule *tree.AlterBackupSchedule) *tree.FullBackupClause {
+	for _, cmd := range alterSchedule.Cmds {
+		fullBackupCmd, ok := cmd.(*tree.AlterBackupScheduleSetFullBackup)
+		if !ok {
+			continue
+		}
+		return &fullBackupCmd.FullBackup
+	}
+	return nil
+}
+
+func sortedClauses(cmds *tree.AlterBackupScheduleCmds) tree.AlterBackupScheduleCmds {
+	retval := make(tree.AlterBackupScheduleCmds, len(*cmds))
+	copy(retval, *cmds)
+	for i, cmd := range retval {
+		_, ok := cmd.(*tree.AlterBackupScheduleSetFullBackup)
+		if !ok {
+			continue
+		}
+		retval[0], retval[i] = retval[i], retval[0]
+	}
+	return retval
+}
+
 // doAlterBackupSchedule creates requested schedule (or schedules).
 // It is a plan hook implementation responsible for the creating of scheduled backup.
 func doAlterBackupSchedules(
@@ -183,10 +208,83 @@ func doAlterBackupSchedules(
 	_, _ = pretty.Println(incStmt)
 	fmt.Println("$$$$$$$$$$$$$$$$$$$$$$$")
 
+	fullBackupClause := findFullBackupClause(alterSchedule)
+	ex := p.ExecCfg().InternalExecutor
+	if fullBackupClause != nil && fullBackupClause.AlwaysFull && incJob != nil {
+		if err := fullJob.SetSchedule(incJob.ScheduleExpr()); err != nil {
+			return err
+		}
+		fullArgs.DependentScheduleID = 0
+		if err := incJob.Delete(ctx, ex, p.Txn()); err != nil {
+			return err
+		}
+	} else if fullBackupClause != nil && !fullBackupClause.AlwaysFull && incJob == nil {
+		incStmt = &tree.Backup{}
+		*incStmt = *fullStmt
+		incStmt.AppendToLatest = true
+		incRecurrence := &scheduleRecurrence{
+			// No need to set frequency here. That's only used to guess a full
+			// backup cadence, but we can only get here with an explicit full
+			// cadence.
+			cron: fullJob.ScheduleExpr(),
+		}
+		incJob, incArgs, err = makeBackupSchedule(
+			env,
+			p.User(),
+			fullJob.ScheduleLabel(),
+			incRecurrence,
+			*fullJob.ScheduleDetails(),
+			jobs.InvalidScheduleID,
+			fullArgs.UpdatesLastBackupMetric,
+			incStmt,
+			fullArgs.ChainProtectedTimestampRecords,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		// Incremental is paused until FULL completes.
+		incJob.Pause()
+		incJob.SetScheduleStatus("Waiting for initial backup to complete")
+
+		_, _ = pretty.Println(incArgs)
+
+		if err := incJob.Create(ctx, ex, p.Txn()); err != nil {
+			return err
+		}
+
+		// Update full recurrence, unpause ID
+		fullRecurrenceFn, err := p.TypeAsString(ctx, fullBackupClause.Recurrence, alterBackupScheduleOp)
+		if err != nil {
+			return err
+		}
+		fullRecurrenceStr, err := fullRecurrenceFn()
+		if err != nil {
+			return err
+		}
+		if err := fullJob.SetSchedule(fullRecurrenceStr); err != nil {
+			return err
+		}
+		fullArgs.UnpauseOnSuccess = incJob.ScheduleID()
+	}
+
+	fullAny, err := pbtypes.MarshalAny(fullArgs)
+	if err != nil {
+		return err
+	}
+	fullJob.SetExecutionDetails(schedule.ExecutorType(), jobspb.ExecutionArguments{Args: fullAny})
+
+	incAny, err := pbtypes.MarshalAny(incArgs)
+	if err != nil {
+		return err
+	}
+	incJob.SetExecutionDetails(schedule.ExecutorType(), jobspb.ExecutionArguments{Args: incAny})
+
 	// [DONE] Validate: No duplicate command-types
-	// Is new schedule incremental?
+	// [DONE] Is new schedule incremental?
 	// - Yes: If old schedule is full, add incremental
-	// - No:  If old schedule is inc, delete incremental.
+	// [DONE] - No:  If old schedule is inc, delete incremental.
 	// Make changes
 	// Verify backup
 	// save + return
