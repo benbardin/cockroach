@@ -115,6 +115,63 @@ func sortedCmds(cmds tree.AlterBackupScheduleCmds) tree.AlterBackupScheduleCmds 
 	return retval
 }
 
+func loadSchedules(
+	ctx context.Context, p sql.PlanHookState, alterSchedule *tree.AlterBackupSchedule,
+) (
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	error,
+) {
+	scheduleID := alterSchedule.ScheduleID
+	_, _ = pretty.Println(alterSchedule)
+
+	execCfg := p.ExecCfg()
+	env := sql.JobSchedulerEnv(execCfg)
+	schedule, err := jobs.LoadScheduledJob(ctx, env, scheduleID, execCfg.InternalExecutor, p.Txn())
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	args := &backuppb.ScheduledBackupExecutionArgs{}
+	if err := pbtypes.UnmarshalAny(schedule.ExecutionArgs().Args, args); err != nil {
+		return nil, nil, nil, nil, errors.Wrap(err, "un-marshaling args")
+	}
+
+	var dependentSchedule *jobs.ScheduledJob
+	var dependentArgs *backuppb.ScheduledBackupExecutionArgs
+
+	if args.DependentScheduleID != 0 {
+		dependentSchedule, err = jobs.LoadScheduledJob(ctx, env, args.DependentScheduleID, execCfg.InternalExecutor, p.Txn())
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		dependentArgs = &backuppb.ScheduledBackupExecutionArgs{}
+		if err := pbtypes.UnmarshalAny(dependentSchedule.ExecutionArgs().Args, dependentArgs); err != nil {
+			return nil, nil, nil, nil, errors.Wrap(err, "un-marshaling args")
+		}
+	}
+
+	var fullJob, incJob *jobs.ScheduledJob
+	var fullArgs, incArgs *backuppb.ScheduledBackupExecutionArgs
+	if args.BackupType == backuppb.ScheduledBackupExecutionArgs_FULL {
+		fullJob, fullArgs = schedule, args
+		incJob, incArgs = dependentSchedule, dependentArgs
+	} else {
+		fullJob, fullArgs = dependentSchedule, dependentArgs
+		incJob, incArgs = schedule, args
+	}
+	fmt.Println("^^^^^^^^^^^^^^^^^^^^^^^")
+	_, _ = pretty.Println(fullJob)
+	_, _ = pretty.Println(fullArgs)
+	fmt.Println("-----------------------")
+	_, _ = pretty.Println(incJob)
+	_, _ = pretty.Println(incArgs)
+	fmt.Println("$$$$$$$$$$$$$$$$$$$$$$$")
+	return fullJob, fullArgs, incJob, incArgs, nil
+}
+
 // doAlterBackupSchedule creates requested schedule (or schedules).
 // It is a plan hook implementation responsible for the creating of scheduled backup.
 func doAlterBackupSchedules(
@@ -131,72 +188,11 @@ func doAlterBackupSchedules(
 		return errors.Wrapf(err, "Invalid ALTER BACKUP command")
 	}
 
-	scheduleID := alterSchedule.ScheduleID
-	_, _ = pretty.Println(alterSchedule)
-
-	execCfg := p.ExecCfg()
-	env := sql.JobSchedulerEnv(execCfg)
-
-	schedule, err := jobs.LoadScheduledJob(ctx, env, scheduleID, execCfg.InternalExecutor, p.Txn())
+	fullJob, fullArgs, incJob, incArgs, err := loadSchedules(
+		ctx, p, alterSchedule)
 	if err != nil {
 		return err
 	}
-
-	args := &backuppb.ScheduledBackupExecutionArgs{}
-	if err := pbtypes.UnmarshalAny(schedule.ExecutionArgs().Args, args); err != nil {
-		return errors.Wrap(err, "un-marshaling args")
-	}
-	node, err := parser.ParseOne(args.BackupStatement)
-	if err != nil {
-		return err
-	}
-	backupStmt, ok := node.AST.(*tree.Backup)
-	if !ok {
-		return errors.Newf("unexpected node type %T", node)
-	}
-
-	var dependentSchedule *jobs.ScheduledJob
-	dependentArgs := &backuppb.ScheduledBackupExecutionArgs{}
-	var dependentBackupStmt *tree.Backup
-	if args.DependentScheduleID != 0 {
-		dependentSchedule, err = jobs.LoadScheduledJob(ctx, env, args.DependentScheduleID, execCfg.InternalExecutor, p.Txn())
-		if err != nil {
-			return err
-		}
-		if err := pbtypes.UnmarshalAny(dependentSchedule.ExecutionArgs().Args, dependentArgs); err != nil {
-			return errors.Wrap(err, "un-marshaling args")
-		}
-		node, err := parser.ParseOne(dependentArgs.BackupStatement)
-		if err != nil {
-			return err
-		}
-		dependentBackupStmt, ok = node.AST.(*tree.Backup)
-		if !ok {
-			return errors.Newf("unexpected node type %T", node)
-		}
-	}
-
-	var fullJob, incJob *jobs.ScheduledJob
-	var fullArgs, incArgs *backuppb.ScheduledBackupExecutionArgs
-	var fullStmt, incStmt *tree.Backup
-	if args.BackupType == backuppb.ScheduledBackupExecutionArgs_FULL {
-		fullJob, fullArgs, fullStmt = schedule, args, backupStmt
-		incJob, incArgs, incStmt = dependentSchedule, dependentArgs, dependentBackupStmt
-	} else {
-		fullJob, fullArgs, fullStmt = dependentSchedule, dependentArgs, dependentBackupStmt
-		incJob, incArgs, incStmt = schedule, args, backupStmt
-	}
-
-	fmt.Println("^^^^^^^^^^^^^^^^^^^^^^^")
-	_, _ = pretty.Println(fullJob)
-	_, _ = pretty.Println(fullArgs)
-	_, _ = pretty.Println(fullStmt)
-	fmt.Println("-----------------------")
-	_, _ = pretty.Println(incJob)
-	_, _ = pretty.Println(incArgs)
-	_, _ = pretty.Println(incStmt)
-	fmt.Println("$$$$$$$$$$$$$$$$$$$$$$$")
-
 	cmds := sortedCmds(alterSchedule.Cmds)
 	for _, cmd := range cmds {
 		fullJob, fullArgs, incJob, incArgs, err = processCmd(ctx, p, cmd, fullJob, fullArgs, incJob, incArgs)
@@ -212,7 +208,7 @@ func doAlterBackupSchedules(
 	fullJob.SetExecutionDetails(
 		tree.ScheduledBackupExecutor.InternalName(),
 		jobspb.ExecutionArguments{Args: fullAny})
-	if err := fullJob.Update(ctx, execCfg.InternalExecutor, p.Txn()); err != nil {
+	if err := fullJob.Update(ctx, p.ExecCfg().InternalExecutor, p.Txn()); err != nil {
 		return err
 	}
 
@@ -224,7 +220,7 @@ func doAlterBackupSchedules(
 		incJob.SetExecutionDetails(
 			tree.ScheduledBackupExecutor.InternalName(),
 			jobspb.ExecutionArguments{Args: incAny})
-		if err := incJob.Update(ctx, execCfg.InternalExecutor, p.Txn()); err != nil {
+		if err := incJob.Update(ctx, p.ExecCfg().InternalExecutor, p.Txn()); err != nil {
 			return err
 		}
 	}
@@ -311,7 +307,6 @@ func processSetFullBackup(
 			return nil, nil, nil, nil, err
 		}
 
-		_, _ = pretty.Println("### pre-make")
 		incJob, incArgs, err = makeBackupSchedule(
 			env,
 			p.User(),
@@ -323,7 +318,6 @@ func processSetFullBackup(
 			stmt,
 			fullArgs.ChainProtectedTimestampRecords,
 		)
-		_, _ = pretty.Println("### post-make")
 
 		if err != nil {
 			return nil, nil, nil, nil, err
@@ -333,6 +327,7 @@ func processSetFullBackup(
 		// until a full backup completes.
 		incJob.Pause()
 		incJob.SetScheduleStatus("Waiting for initial backup to complete")
+		incArgs.DependentScheduleID = fullJob.ScheduleID()
 
 		_, _ = pretty.Println(incArgs)
 
@@ -348,6 +343,7 @@ func processSetFullBackup(
 			return nil, nil, nil, nil, err
 		}
 		fullArgs.UnpauseOnSuccess = incJob.ScheduleID()
+		fullArgs.DependentScheduleID = incJob.ScheduleID()
 	}
 	// We already have an incremental backup. Leave it alone, and just edit the
 	// cadence on the full.
@@ -374,7 +370,7 @@ func processSetFullBackup(
 
 	// [DONE] Validate: No duplicate command-types
 	// [DONE] Is new schedule incremental?
-	// - Yes: If old schedule is full, add incremental
+	// [Done] - Yes: If old schedule is full, add incremental
 	// [DONE] - No:  If old schedule is inc, delete incremental.
 	// Make changes
 	// Verify backup
