@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/kr/pretty"
 	"github.com/robfig/cron/v3"
 )
 
@@ -101,6 +102,7 @@ func LoadScheduledJob(
 	ex sqlutil.InternalExecutor,
 	txn *kv.Txn,
 ) (*ScheduledJob, error) {
+	_, _ = pretty.Println("### Loading from %s", env.ScheduledJobsTableName())
 	row, cols, err := ex.QueryRowExWithCols(ctx, "lookup-schedule", txn,
 		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = %d",
@@ -439,6 +441,7 @@ func (j *ScheduledJob) Delete(ctx context.Context, ex sqlutil.InternalExecutor, 
 	if j.rec.ScheduleID == 0 {
 		return errors.New("cannot delete schedule: missing schedule id")
 	}
+	_, _ = pretty.Println("### Dropping from from %s", j.env.ScheduledJobsTableName())
 	_, err := ex.ExecEx(ctx, "sched-delete", txn,
 		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		fmt.Sprintf("DELETE FROM %s WHERE schedule_id = %d",

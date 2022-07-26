@@ -102,20 +102,9 @@ func validateAlterSchedule(alterSchedule *tree.AlterBackupSchedule) error {
 	return nil
 }
 
-func findFullBackupClause(alterSchedule *tree.AlterBackupSchedule) *tree.FullBackupClause {
-	for _, cmd := range alterSchedule.Cmds {
-		fullBackupCmd, ok := cmd.(*tree.AlterBackupScheduleSetFullBackup)
-		if !ok {
-			continue
-		}
-		return &fullBackupCmd.FullBackup
-	}
-	return nil
-}
-
-func sortedClauses(cmds *tree.AlterBackupScheduleCmds) tree.AlterBackupScheduleCmds {
-	retval := make(tree.AlterBackupScheduleCmds, len(*cmds))
-	copy(retval, *cmds)
+func sortedCmds(cmds tree.AlterBackupScheduleCmds) tree.AlterBackupScheduleCmds {
+	retval := make(tree.AlterBackupScheduleCmds, len(cmds))
+	copy(retval, cmds)
 	for i, cmd := range retval {
 		_, ok := cmd.(*tree.AlterBackupScheduleSetFullBackup)
 		if !ok {
@@ -208,26 +197,121 @@ func doAlterBackupSchedules(
 	_, _ = pretty.Println(incStmt)
 	fmt.Println("$$$$$$$$$$$$$$$$$$$$$$$")
 
-	fullBackupClause := findFullBackupClause(alterSchedule)
-	ex := p.ExecCfg().InternalExecutor
-	if fullBackupClause != nil && fullBackupClause.AlwaysFull && incJob != nil {
-		if err := fullJob.SetSchedule(incJob.ScheduleExpr()); err != nil {
+	cmds := sortedCmds(alterSchedule.Cmds)
+	for _, cmd := range cmds {
+		fullJob, fullArgs, incJob, incArgs, err = processCmd(ctx, p, cmd, fullJob, fullArgs, incJob, incArgs)
+		if err != nil {
 			return err
+		}
+	}
+
+	fullAny, err := pbtypes.MarshalAny(fullArgs)
+	if err != nil {
+		return err
+	}
+	fullJob.SetExecutionDetails(
+		tree.ScheduledBackupExecutor.InternalName(),
+		jobspb.ExecutionArguments{Args: fullAny})
+	if err := fullJob.Update(ctx, execCfg.InternalExecutor, p.Txn()); err != nil {
+		return err
+	}
+
+	if incJob != nil {
+		incAny, err := pbtypes.MarshalAny(incArgs)
+		if err != nil {
+			return err
+		}
+		incJob.SetExecutionDetails(
+			tree.ScheduledBackupExecutor.InternalName(),
+			jobspb.ExecutionArguments{Args: incAny})
+		if err := incJob.Update(ctx, execCfg.InternalExecutor, p.Txn()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func processCmd(
+	ctx context.Context,
+	p sql.PlanHookState,
+	cmd tree.AlterBackupScheduleCmd,
+	fullJob *jobs.ScheduledJob,
+	fullArgs *backuppb.ScheduledBackupExecutionArgs,
+	incJob *jobs.ScheduledJob,
+	incArgs *backuppb.ScheduledBackupExecutionArgs,
+) (
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	error,
+) {
+	switch typedCmd := cmd.(type) {
+	case *tree.AlterBackupScheduleSetFullBackup:
+		return processSetFullBackup(ctx, p, typedCmd, fullJob, fullArgs, incJob, incArgs)
+	}
+	return fullJob, fullArgs, incJob, incArgs, nil
+}
+
+func processSetFullBackup(
+	ctx context.Context,
+	p sql.PlanHookState,
+	cmd *tree.AlterBackupScheduleSetFullBackup,
+	fullJob *jobs.ScheduledJob,
+	fullArgs *backuppb.ScheduledBackupExecutionArgs,
+	incJob *jobs.ScheduledJob,
+	incArgs *backuppb.ScheduledBackupExecutionArgs,
+) (
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	*jobs.ScheduledJob,
+	*backuppb.ScheduledBackupExecutionArgs,
+	error,
+) {
+	env := sql.JobSchedulerEnv(p.ExecCfg())
+	ex := p.ExecCfg().InternalExecutor
+	fullBackupClause := cmd.FullBackup
+	if fullBackupClause.AlwaysFull {
+		if incJob == nil {
+			// Nothing to do.
+			return fullJob, fullArgs, incJob, incArgs, nil
+		}
+		// Copy the cadence from the incremental to the full, and delete the
+		// incremental.
+		if err := fullJob.SetSchedule(incJob.ScheduleExpr()); err != nil {
+			return nil, nil, nil, nil, err
 		}
 		fullArgs.DependentScheduleID = 0
 		if err := incJob.Delete(ctx, ex, p.Txn()); err != nil {
-			return err
+			return nil, nil, nil, nil, err
 		}
-	} else if fullBackupClause != nil && !fullBackupClause.AlwaysFull && incJob == nil {
-		incStmt = &tree.Backup{}
-		*incStmt = *fullStmt
-		incStmt.AppendToLatest = true
-		incRecurrence := &scheduleRecurrence{
-			// No need to set frequency here. That's only used to guess a full
-			// backup cadence, but we can only get here with an explicit full
-			// cadence.
-			cron: fullJob.ScheduleExpr(),
+		incJob = nil
+		incArgs = nil
+		return fullJob, fullArgs, incJob, incArgs, nil
+	}
+	// We have FULL BACKUP <cron>.
+	if incJob == nil {
+		// No existing incremental job, so we need to create it, copying details
+		// from the full.
+		node, err := parser.ParseOne(fullArgs.BackupStatement)
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
+		stmt, ok := node.AST.(*tree.Backup)
+		if !ok {
+			return nil, nil, nil, nil, errors.Newf("unexpected node type %T", node)
+		}
+		stmt.AppendToLatest = true
+
+		scheduleExprFn := func() (string, error) {
+			return fullJob.ScheduleExpr(), nil
+		}
+		incRecurrence, err := computeScheduleRecurrence(env.Now(), scheduleExprFn)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+		_, _ = pretty.Println("### pre-make")
 		incJob, incArgs, err = makeBackupSchedule(
 			env,
 			p.User(),
@@ -236,50 +320,57 @@ func doAlterBackupSchedules(
 			*fullJob.ScheduleDetails(),
 			jobs.InvalidScheduleID,
 			fullArgs.UpdatesLastBackupMetric,
-			incStmt,
+			stmt,
 			fullArgs.ChainProtectedTimestampRecords,
 		)
+		_, _ = pretty.Println("### post-make")
 
 		if err != nil {
-			return err
+			return nil, nil, nil, nil, err
 		}
 
-		// Incremental is paused until FULL completes.
+		// We don't know if a full backup has completed yet, so pause incremental
+		// until a full backup completes.
 		incJob.Pause()
 		incJob.SetScheduleStatus("Waiting for initial backup to complete")
 
 		_, _ = pretty.Println(incArgs)
 
-		if err := incJob.Create(ctx, ex, p.Txn()); err != nil {
-			return err
+		incAny, err := pbtypes.MarshalAny(incArgs)
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
+		incJob.SetExecutionDetails(
+			tree.ScheduledBackupExecutor.InternalName(),
+			jobspb.ExecutionArguments{Args: incAny})
 
-		// Update full recurrence, unpause ID
-		fullRecurrenceFn, err := p.TypeAsString(ctx, fullBackupClause.Recurrence, alterBackupScheduleOp)
-		if err != nil {
-			return err
-		}
-		fullRecurrenceStr, err := fullRecurrenceFn()
-		if err != nil {
-			return err
-		}
-		if err := fullJob.SetSchedule(fullRecurrenceStr); err != nil {
-			return err
+		if err := incJob.Create(ctx, ex, p.Txn()); err != nil {
+			return nil, nil, nil, nil, err
 		}
 		fullArgs.UnpauseOnSuccess = incJob.ScheduleID()
+	}
+	// We already have an incremental backup. Leave it alone, and just edit the
+	// cadence on the full.
+
+	fullRecurrenceFn, err := p.TypeAsString(ctx, fullBackupClause.Recurrence, alterBackupScheduleOp)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	fullRecurrenceStr, err := fullRecurrenceFn()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if err := fullJob.SetSchedule(fullRecurrenceStr); err != nil {
+		return nil, nil, nil, nil, err
 	}
 
 	fullAny, err := pbtypes.MarshalAny(fullArgs)
 	if err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
-	fullJob.SetExecutionDetails(schedule.ExecutorType(), jobspb.ExecutionArguments{Args: fullAny})
-
-	incAny, err := pbtypes.MarshalAny(incArgs)
-	if err != nil {
-		return err
-	}
-	incJob.SetExecutionDetails(schedule.ExecutorType(), jobspb.ExecutionArguments{Args: incAny})
+	fullJob.SetExecutionDetails(
+		tree.ScheduledBackupExecutor.InternalName(),
+		jobspb.ExecutionArguments{Args: fullAny})
 
 	// [DONE] Validate: No duplicate command-types
 	// [DONE] Is new schedule incremental?
@@ -289,7 +380,7 @@ func doAlterBackupSchedules(
 	// Verify backup
 	// save + return
 
-	return nil
+	return fullJob, fullArgs, incJob, incArgs, nil
 	/*
 		// Prepare backup statement (full).
 		backupNode := &tree.Backup{
