@@ -158,6 +158,8 @@ func TestCloudBackupRestoreAzure(t *testing.T) {
 		skip.IgnoreLint(t, "AZURE_CONTAINER env var must be set")
 	}
 
+	// TODO(dan): Actually invalidate the descriptor cache and delete this line.
+	defer lease.TestingDisableTableLeases()()
 	const numAccounts = 1000
 
 	ctx := context.Background()
